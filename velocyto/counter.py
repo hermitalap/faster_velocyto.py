@@ -15,17 +15,20 @@ import pysam
 import numpy as np
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 
 class ExInCounter:
     """ Main class to do the counting of introns and exons """
     def __init__(self, sampleid: str, logic: vcy.Logic, valid_bcset: Set[str]=None,
                  umi_extension: str="no", onefilepercell: bool=False, dump_option: str="0",
-                 outputfolder: str="./", loom_numeric_dtype: str=vcy.LOOM_NUMERIC_DTYPE) -> None:
+                 outputfolder: str="./", loom_numeric_dtype: str=vcy.LOOM_NUMERIC_DTYPE,
+                 max_workers: int=None) -> None:
         self.outputfolder = outputfolder
         self.sampleid = sampleid
         self.loom_numeric_dtype = loom_numeric_dtype
         self.logic = logic()
+        self.max_workers = max_workers if max_workers and max_workers > 0 else (os.cpu_count() or 1)
         # NOTE: maybe there shoulb be a self.logic.verify_inputs(args) step at the end of init
         if valid_bcset is None:
             self.valid_bcset: Set[str] = set()
@@ -797,6 +800,58 @@ class ExInCounter:
         logging.debug(f"Counting done!")
         return dict_list_arrays, cell_bcs_order
 
+    def _count_molitems_chunk(self, molitems_slice: List[Tuple[str, vcy.Molitem]], bc2idx: Dict[str, int],
+                              shape: Tuple[int, int]) -> Tuple[Dict[str, np.ndarray], int, Counter]:
+        dict_layers_columns: Dict[str, np.ndarray] = {
+            layer_name: np.zeros(shape, dtype=self.loom_numeric_dtype, order="C")
+            for layer_name in self.logic.layers
+        }
+        failures = 0
+        counter: Counter = Counter()
+        for bcumi, molitem in molitems_slice:
+            bc = bcumi.split("$")[0]
+            bcidx = bc2idx[bc]
+            rcode = self.logic.count(molitem, bcidx, dict_layers_columns, self.geneid2ix)
+            if rcode:
+                failures += 1
+                counter[rcode] += 1
+        return dict_layers_columns, failures, counter
+
+    def _aggregate_molitems(self, molitems: Dict[str, vcy.Molitem], bc2idx: Dict[str, int],
+                            shape: Tuple[int, int]) -> Tuple[Dict[str, np.ndarray], int, Counter]:
+        if not molitems:
+            return ({layer_name: np.zeros(shape, dtype=self.loom_numeric_dtype, order="C")
+                     for layer_name in self.logic.layers}, 0, Counter())
+
+        items = list(molitems.items())
+        workers = min(self.max_workers, len(items))
+
+        if workers <= 1:
+            return self._count_molitems_chunk(items, bc2idx, shape)
+
+        chunk_size = max(1, len(items) // workers)
+        aggregate_layers: Dict[str, np.ndarray] = {
+            layer_name: np.zeros(shape, dtype=self.loom_numeric_dtype, order="C")
+            for layer_name in self.logic.layers
+        }
+        total_failures = 0
+        total_counter: Counter = Counter()
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vcy-counter") as executor:
+            futures = [
+                executor.submit(self._count_molitems_chunk, items[i:i + chunk_size], bc2idx, shape)
+                for i in range(0, len(items), chunk_size)
+            ]
+
+            for future in futures:
+                dict_layers_columns, failures, counter = future.result()
+                for layer_name, layer_columns in dict_layers_columns.items():
+                    aggregate_layers[layer_name] += layer_columns
+                total_failures += failures
+                total_counter.update(counter)
+
+        return aggregate_layers, total_failures, total_counter
+
     def _count_cell_batch_stranded(self) -> Tuple[Dict[str, np.ndarray], List[str]]:
         """It performs molecule counting for the current batch of cells in the case of stranded method
 
@@ -840,22 +895,9 @@ class ExInCounter:
         # initialize np.ndarray
         shape = (len(self.geneid2ix), len(self.cell_batch))
 
-        dict_layers_columns: Dict[str, np.ndarray] = {}
-        for layer_name in self.logic.layers:
-            dict_layers_columns[layer_name] = np.zeros(shape, dtype=self.loom_numeric_dtype, order="C")
-
         bc2idx: Dict[str, int] = dict(zip(self.cell_batch, range(len(self.cell_batch))))
         # After the whole file has been read, do the actual counting
-        failures = 0
-        counter: Counter = Counter()
-        for bcumi, molitem in molitems.items():
-            bc = bcumi.split("$")[0]  # extract the bc part from the bc+umi
-            bcidx = bc2idx[bc]
-            rcode = self.logic.count(molitem, bcidx, dict_layers_columns, self.geneid2ix)
-            if rcode:
-                failures += 1
-                counter[rcode] += 1
-            # before it was molitem.count(bcidx, spliced, unspliced, ambiguous, self.geneid2ix)
+        dict_layers_columns, failures, counter = self._aggregate_molitems(molitems, bc2idx, shape)
         if failures > (0.25 * len(molitems)):
             logging.warn(f"More than 20% ({(100*failures / len(molitems)):.1f}%) of molitems trashed, of those:")
             logging.warn(f"A situation where many genes were compatible with the observation in {(100*counter[1] / len(molitems)):.1f} cases")
@@ -996,18 +1038,9 @@ class ExInCounter:
         # initialize np.ndarray
         shape = (len(self.geneid2ix), len(self.cell_batch))
 
-        dict_layers_columns: Dict[str, np.ndarray] = {}
-        for layer_name in self.logic.layers:
-            dict_layers_columns[layer_name] = np.zeros(shape, dtype=self.loom_numeric_dtype, order="C")
-
         bc2idx: Dict[str, int] = dict(zip(self.cell_batch, range(len(self.cell_batch))))
         # After the whole file has been read, do the actual counting
-        for bcumi, molitem in molitems.items():
-            bc = bcumi.split("$")[0]  # extract the bc part from the bc+umi
-            bcidx = bc2idx[bc]
-            self.logic.count(molitem, bcidx, dict_layers_columns, self.geneid2ix)
-            # NOTE I need to generalize this to any set of layers
-            # before it was molitem.count(bcidx, spliced, unspliced, ambiguous, self.geneid2ix)
+        dict_layers_columns, _, _ = self._aggregate_molitems(molitems, bc2idx, shape)
         
         if self.every_n_report and ((self.report_state % self.every_n_report) == 0):
             if self.kind_of_report == "p":
@@ -1155,18 +1188,9 @@ class ExInCounter:
         # initialize np.ndarray
         shape = (len(self.geneid2ix), len(self.cell_batch))
 
-        dict_layers_columns: Dict[str, np.ndarray] = {}
-        for layer_name in self.logic.layers:
-            dict_layers_columns[layer_name] = np.zeros(shape, dtype=self.loom_numeric_dtype, order="C")
-
         bc2idx: Dict[str, int] = dict(zip(self.cell_batch, range(len(self.cell_batch))))
         # After the whole file has been read, do the actual counting
-        for bcumi, molitem in molitems.items():
-            bc = bcumi.split("$")[0]  # extract the bc part from the bc+umi
-            bcidx = bc2idx[bc]
-            self.logic.count(molitem, bcidx, dict_layers_columns, self.geneid2ix)
-            # NOTE I need to generalize this to any set of layers
-            # before it was molitem.count(bcidx, spliced, unspliced, ambiguous, self.geneid2ix)
+        dict_layers_columns, _, _ = self._aggregate_molitems(molitems, bc2idx, shape)
         
         if self.every_n_report and ((self.report_state % self.every_n_report) == 0):
             if self.kind_of_report == "p":
